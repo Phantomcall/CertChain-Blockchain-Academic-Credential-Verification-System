@@ -1163,6 +1163,8 @@ mod tests {
         let owner = Address::generate(&env);
         env.as_contract(&contract, || {
             assert!(CertChainCredential::initialize(env.clone(), owner.clone()).is_ok());
+            assert_eq!(CertChainCredential::get_owner(env.clone()), owner);
+            assert_eq!(CertChainCredential::get_pending_owner(env.clone()), None);
             assert_eq!(
                 CertChainCredential::initialize(env.clone(), owner),
                 Err(ContractError::AlreadyInitialized)
@@ -4550,5 +4552,43 @@ mod proptest_invariants {
             CertChainCredential::revoke_credential(env.clone(), token_id, owner.clone()).unwrap();
         });
         assert!(client.is_revoked(&token_id));
+    }
+
+    // ── issue #111: cover owner and pending-owner read happy paths ─────────
+
+    #[test]
+    fn test_governance_reads_owner_immediately_after_initialization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract = CertChainCredential.register(&env, None, ());
+        let owner = Address::generate(&env);
+        let client = CertChainCredentialClient::new(&env, &contract);
+
+        client.initialize(&owner);
+
+        // Verify get_owner returns initialized owner and get_pending_owner is None
+        assert_eq!(client.get_owner(), owner);
+        assert_eq!(client.get_pending_owner(), None);
+    }
+
+    #[test]
+    fn test_governance_reads_ownership_lifecycle_happy_path() {
+        let (env, contract, initial_owner, _, _) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+        let new_owner = Address::generate(&env);
+
+        // Initial setup state
+        assert_eq!(client.get_owner(), initial_owner);
+        assert_eq!(client.get_pending_owner(), None);
+
+        // Propose transfer: owner is unchanged, pending owner is set
+        client.transfer_owner(&new_owner);
+        assert_eq!(client.get_owner(), initial_owner);
+        assert_eq!(client.get_pending_owner(), Some(new_owner.clone()));
+
+        // Accept transfer: owner is updated, pending owner is cleared
+        client.accept_owner();
+        assert_eq!(client.get_owner(), new_owner);
+        assert_eq!(client.get_pending_owner(), None);
     }
 }
