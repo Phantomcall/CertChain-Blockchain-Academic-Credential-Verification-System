@@ -3,9 +3,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 /* ── Hoisted mocks ───────────────────────────────────────────────────────────── */
 
-const { mockGetServiceRoleClient, mockAuthorizeCronRequest } = vi.hoisted(() => ({
+const {
+    mockGetServiceRoleClient,
+    mockAuthorizeCronRequest,
+    mockCaptureException,
+    mockRecordMetric,
+} = vi.hoisted(() => ({
     mockGetServiceRoleClient: vi.fn(),
     mockAuthorizeCronRequest: vi.fn(),
+    mockCaptureException: vi.fn(),
+    mockRecordMetric: vi.fn(),
 }));
 
 vi.mock('../src/lib/serverAuth', () => ({
@@ -18,7 +25,8 @@ vi.mock('../src/lib/cronAuth', () => ({
 
 vi.mock('../src/lib/debug', () => ({
     structuredLog: vi.fn(),
-    captureException: vi.fn(),
+    captureException: mockCaptureException,
+    recordMetric: mockRecordMetric,
 }));
 
 import { GET } from '../src/app/api/cron/retention/route';
@@ -38,6 +46,8 @@ function rpcClient(result: { data?: unknown; error?: { message: string } }) {
 beforeEach(() => {
     vi.clearAllMocks();
     mockAuthorizeCronRequest.mockReturnValue({ ok: true });
+    mockCaptureException.mockResolvedValue(undefined);
+    mockRecordMetric.mockResolvedValue(undefined);
 });
 
 describe('cron authorisation', () => {
@@ -122,9 +132,18 @@ describe('GET /api/cron/retention', () => {
             rowsDeleted: 7,
             deleted: { verificationLogs: 5, contactMessages: 2 },
         });
+        expect(mockRecordMetric).toHaveBeenCalledWith(
+            'retention_cron.succeeded',
+            1,
+            expect.objectContaining({
+                runId: 'run-1',
+                rowsDeleted: 7,
+                verificationLogs: 5,
+            }),
+        );
     });
 
-    it('surfaces a recorded purge failure as a 500', async () => {
+    it('surfaces a recorded purge failure as a 500 and alerts observability', async () => {
         // The SQL function records the failure and returns it rather than
         // raising, so a non-succeeded status must not be reported as success.
         mockGetServiceRoleClient.mockReturnValue(
@@ -137,9 +156,18 @@ describe('GET /api/cron/retention', () => {
         expect(response.status).toBe(500);
         expect(body.success).toBe(false);
         expect(body.error).toContain('deadlock');
+        expect(mockCaptureException).toHaveBeenCalledWith(
+            expect.objectContaining({ message: 'deadlock detected' }),
+            expect.objectContaining({ context: 'GET /api/cron/retention', runId: 'run-2' }),
+        );
+        expect(mockRecordMetric).toHaveBeenCalledWith(
+            'retention_cron.failed',
+            1,
+            expect.objectContaining({ runId: 'run-2' }),
+        );
     });
 
-    it('returns 500 when the RPC itself errors', async () => {
+    it('returns 500 and alerts observability when the RPC itself errors', async () => {
         mockGetServiceRoleClient.mockReturnValue(
             rpcClient({ error: { message: 'function does not exist' } }),
         );
@@ -148,6 +176,15 @@ describe('GET /api/cron/retention', () => {
 
         expect(response.status).toBe(500);
         expect((await response.json()).success).toBe(false);
+        expect(mockCaptureException).toHaveBeenCalledWith(
+            expect.objectContaining({ message: 'function does not exist' }),
+            expect.objectContaining({ context: 'GET /api/cron/retention' }),
+        );
+        expect(mockRecordMetric).toHaveBeenCalledWith(
+            'retention_cron.failed',
+            1,
+            expect.any(Object),
+        );
     });
 });
 

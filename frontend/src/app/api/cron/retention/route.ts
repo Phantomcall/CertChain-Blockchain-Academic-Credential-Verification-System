@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getServiceRoleClient } from '@/lib/serverAuth';
 import { authorizeCronRequest } from '@/lib/cronAuth';
-import { captureException, structuredLog } from '@/lib/debug';
+import { captureException, recordMetric, structuredLog } from '@/lib/debug';
 
 export const dynamic = 'force-dynamic';
 
@@ -48,14 +48,25 @@ export async function GET(request: NextRequest) {
 
         // The SQL function records its own failure and returns it rather than
         // raising — re-raising would roll the failure record back. Surface it
-        // as a 500 so the scheduler reports the run as failed.
+        // as a 500 so the scheduler reports the run as failed, and emit an
+        // alert through the observability pipeline.
         if (!result || result.status !== 'succeeded') {
+            const errorMessage = result?.error ?? 'Retention purge failed';
             structuredLog('ERROR', 'Retention purge failed', requestId, {
                 runId: result?.runId,
                 error: result?.error,
             });
+            await captureException(new Error(errorMessage), {
+                requestId,
+                context: 'GET /api/cron/retention',
+                runId: result?.runId,
+            });
+            await recordMetric('retention_cron.failed', 1, {
+                requestId,
+                runId: result?.runId,
+            });
             return NextResponse.json(
-                { success: false, error: result?.error ?? 'Retention purge failed' },
+                { success: false, error: errorMessage },
                 { status: 500 },
             );
         }
@@ -66,6 +77,12 @@ export async function GET(request: NextRequest) {
             verificationLogs: result.verificationLogs,
             contactMessages: result.contactMessages,
             durationMs: result.durationMs,
+        });
+        await recordMetric('retention_cron.succeeded', 1, {
+            requestId,
+            runId: result.runId,
+            rowsDeleted: result.rowsDeleted ?? 0,
+            verificationLogs: result.verificationLogs ?? 0,
         });
 
         return NextResponse.json({
@@ -79,7 +96,8 @@ export async function GET(request: NextRequest) {
             durationMs: result.durationMs ?? null,
         });
     } catch (error) {
-        captureException(error, { requestId, context: 'GET /api/cron/retention' });
+        await captureException(error, { requestId, context: 'GET /api/cron/retention' });
+        await recordMetric('retention_cron.failed', 1, { requestId });
         return NextResponse.json(
             { success: false, error: 'Retention purge could not be started' },
             { status: 500 },
