@@ -12,8 +12,8 @@ regexes = [
   # Public Stellar identifiers are safe to commit (on-chain public data):
   #   C... = Soroban contract IDs, G... = account public keys.
   # Secret seeds (S...) are intentionally NOT allowlisted and remain blocked.
-  '''C[A-Z2-7]{55}''',
-  '''G[A-Z2-7]{55}''',
+  '''\bC[A-Z2-7]{55}\b''',
+  '''\bG[A-Z2-7]{55}\b''',
 ]
 
 [[rules]]
@@ -21,6 +21,24 @@ id = "acredia-stellar-secret-seed"
 description = "Detect Stellar secret seeds (server/deployer private keys)"
 regex = '''\bS[A-Z2-7]{55}\b'''
 keywords = ["stellar", "secret", "seed"]
+
+[[rules]]
+id = "acredia-ttl-keeper-account-secret"
+description = "Detect committed TTL keeper Stellar account secrets"
+regex = '''(?i)TTL_KEEPER_ACCOUNT_SECRET\s*[:=]\s*["']?(S[A-Z2-7]{55})["']?'''
+keywords = ["TTL_KEEPER_ACCOUNT_SECRET"]
+
+[[rules]]
+id = "acredia-resend-api-key"
+description = "Detect committed Resend API keys"
+regex = '''(?i)RESEND_API_KEY\s*[:=]\s*["']?(re_[A-Za-z0-9_-]{20,})["']?'''
+keywords = ["RESEND_API_KEY"]
+
+[[rules]]
+id = "acredia-upstash-redis-rest-token"
+description = "Detect committed Upstash Redis REST tokens"
+regex = '''(?i)UPSTASH_REDIS_REST_TOKEN\s*[:=]\s*["']?([A-Za-z0-9_.-]{20,})["']?'''
+keywords = ["UPSTASH_REDIS_REST_TOKEN"]
 
 [[rules]]
 id = "acredia-supabase-service-role"
