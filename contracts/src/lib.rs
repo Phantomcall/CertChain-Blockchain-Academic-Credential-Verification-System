@@ -51,10 +51,20 @@ const MAX_ISSUER_PROFILE_URI_LEN: u32 = 256;
 // ipfs:// and https:// gateway URIs with CID v1 + filename suffixes.
 const MAX_IPFS_URI_LEN: u32 = 512;
 
+/// Entries per student/issuer index page (#104). Issuance reads and rewrites
+/// at most one page, so its cost no longer grows with an address's history.
+/// Also the maximum `limit` of the paginated index queries.
+const INDEX_PAGE_SIZE: u32 = 100;
+
 // Semantic version of this contract, bumped with each named release.
 const CONTRACT_VERSION: &str = "certchain-stellar:2.0.0";
 
 const UPGRADE_TIMELOCK_LEDGERS: u32 = 120_960;
+
+/// Storage schema version this binary reads and writes. Migrations only move
+/// forward: state stamped with a higher version is refused rather than
+/// silently reinterpreted by older code (#109).
+const CURRENT_STORAGE_VERSION: u32 = 2;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -78,6 +88,9 @@ pub enum ContractError {
     UpgradeTimelockActive = 16,
     /// The supplied IPFS URI exceeds MAX_IPFS_URI_LEN bytes (audit F-7).
     IpfsUriTooLarge = 17,
+    /// Stored state was written by a newer schema than this binary
+    /// understands; migrations are forward-only (#109).
+    UnsupportedStorageVersion = 18,
 }
 
 #[contracttype]
@@ -98,6 +111,14 @@ pub enum DataKey {
     StudentIndex(Address),
     /// List of token IDs issued by a specific authorized issuer.
     IssuerIndex(Address),
+    /// Page `n >= 1` of a student's index (#104). Page 0 is `StudentIndex`.
+    StudentIndexPage(Address, u32),
+    /// Page `n >= 1` of an issuer's index (#104). Page 0 is `IssuerIndex`.
+    IssuerIndexPage(Address, u32),
+    /// Length bookkeeping for a student's paginated index (#104).
+    StudentIndexMeta(Address),
+    /// Length bookkeeping for an issuer's paginated index (#104).
+    IssuerIndexMeta(Address),
 }
 
 #[contracttype]
@@ -170,6 +191,37 @@ pub struct ContractInfo {
     pub version: String,
 }
 
+/// Bookkeeping for a paginated address index (#104).
+///
+/// Page 0 is the original `StudentIndex`/`IssuerIndex` vector. It grows until
+/// it holds `INDEX_PAGE_SIZE` entries (or already holds more, for histories
+/// written before pagination), then is frozen with `head` entries; later
+/// entries fill pages 1, 2, ... of `INDEX_PAGE_SIZE` each. Entries are only
+/// ever appended, so a position is a stable cursor.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexMeta {
+    /// Total number of token IDs in the index.
+    pub len: u64,
+    /// Number of entries held by page 0.
+    pub head: u64,
+}
+
+/// One page of a paginated index query (#104). `next_cursor` is the cursor to
+/// pass to get the following page, or `None` when the history is exhausted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexPage {
+    pub ids: Vec<u64>,
+    pub next_cursor: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum IndexKind {
+    Student,
+    Issuer,
+}
+
 #[contract]
 pub struct CertChainCredential;
 
@@ -177,22 +229,124 @@ pub struct CertChainCredential;
 // Index helpers (CertChain v2)
 // ---------------------------------------------------------------------------
 
-/// Append `token_id` to the persistent list stored under `key`.
-///
-/// Each list is a `Vec<u64>` stored in persistent storage with the same
-/// ~1-year TTL as the credentials themselves, so student/issuer history
-/// survives the same archival cycle.
-fn append_to_address_index(env: &Env, key: &DataKey, token_id: u64) {
-    let mut list: Vec<u64> = env
-        .storage()
+fn index_page_key(kind: IndexKind, addr: &Address, page: u32) -> DataKey {
+    match (kind, page) {
+        (IndexKind::Student, 0) => DataKey::StudentIndex(addr.clone()),
+        (IndexKind::Issuer, 0) => DataKey::IssuerIndex(addr.clone()),
+        (IndexKind::Student, n) => DataKey::StudentIndexPage(addr.clone(), n),
+        (IndexKind::Issuer, n) => DataKey::IssuerIndexPage(addr.clone(), n),
+    }
+}
+
+fn index_meta_key(kind: IndexKind, addr: &Address) -> DataKey {
+    match kind {
+        IndexKind::Student => DataKey::StudentIndexMeta(addr.clone()),
+        IndexKind::Issuer => DataKey::IssuerIndexMeta(addr.clone()),
+    }
+}
+
+fn read_index_page(env: &Env, key: &DataKey) -> Vec<u64> {
+    env.storage()
         .persistent()
         .get(key)
-        .unwrap_or_else(|| Vec::new(env));
-    list.push_back(token_id);
-    env.storage().persistent().set(key, &list);
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+/// Read the index bookkeeping. Histories written before pagination have no
+/// meta entry; their page-0 vector is read once to derive it.
+fn read_index_meta(env: &Env, kind: IndexKind, addr: &Address) -> IndexMeta {
+    if let Some(meta) = env.storage().persistent().get(&index_meta_key(kind, addr)) {
+        return meta;
+    }
+    let legacy = read_index_page(env, &index_page_key(kind, addr, 0));
+    let len = legacy.len() as u64;
+    IndexMeta { len, head: len }
+}
+
+/// Page number and offset within that page of index position `pos`.
+fn index_slot(meta: &IndexMeta, pos: u64) -> (u32, u32) {
+    if pos < meta.head {
+        (0, pos as u32)
+    } else {
+        let rel = pos - meta.head;
+        let page = INDEX_PAGE_SIZE as u64;
+        ((1 + rel / page) as u32, (rel % page) as u32)
+    }
+}
+
+fn extend_persistent_ttl(env: &Env, key: &DataKey) {
     env.storage()
         .persistent()
         .extend_ttl(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+}
+
+/// Append `token_id` to an address's paginated index (#104).
+///
+/// Only the page receiving the entry is read and rewritten, so issuance cost
+/// is bounded by `INDEX_PAGE_SIZE` regardless of how long the history is.
+/// Pages share the credentials' ~1-year TTL so history survives the same
+/// archival cycle.
+fn append_to_address_index(env: &Env, kind: IndexKind, addr: &Address, token_id: u64) {
+    let mut meta = read_index_meta(env, kind, addr);
+    let page_no = if meta.len == meta.head && meta.head < INDEX_PAGE_SIZE as u64 {
+        // Page 0 is still filling up.
+        meta.head += 1;
+        0
+    } else {
+        index_slot(&meta, meta.len).0
+    };
+    let page_key = index_page_key(kind, addr, page_no);
+    let mut page = read_index_page(env, &page_key);
+    page.push_back(token_id);
+    env.storage().persistent().set(&page_key, &page);
+    extend_persistent_ttl(env, &page_key);
+
+    meta.len += 1;
+    let meta_key = index_meta_key(kind, addr);
+    env.storage().persistent().set(&meta_key, &meta);
+    extend_persistent_ttl(env, &meta_key);
+}
+
+/// Up to `limit` token IDs starting at position `cursor` (#104). Reads at most
+/// two pages; `limit` is clamped to `1..=INDEX_PAGE_SIZE`.
+fn read_index_range(
+    env: &Env,
+    kind: IndexKind,
+    addr: &Address,
+    cursor: u64,
+    limit: u32,
+) -> IndexPage {
+    let meta = read_index_meta(env, kind, addr);
+    let limit = limit.clamp(1, INDEX_PAGE_SIZE) as u64;
+    let end = meta.len.min(cursor.saturating_add(limit));
+    let mut ids = Vec::new(env);
+    let mut pos = cursor;
+    while pos < end {
+        let (page_no, offset) = index_slot(&meta, pos);
+        let key = index_page_key(kind, addr, page_no);
+        let page = read_index_page(env, &key);
+        if offset >= page.len() {
+            break; // defensive: never loop on a missing or short page
+        }
+        extend_persistent_ttl(env, &key);
+        let mut i = offset;
+        while i < page.len() && pos < end {
+            ids.push_back(page.get_unchecked(i));
+            i += 1;
+            pos += 1;
+        }
+    }
+    let next_cursor = if pos < meta.len { Some(pos) } else { None };
+    IndexPage { ids, next_cursor }
+}
+
+fn first_index_page(env: &Env, kind: IndexKind, addr: &Address) -> Vec<u64> {
+    let key = index_page_key(kind, addr, 0);
+    let list = read_index_page(env, &key);
+    if !list.is_empty() {
+        extend_persistent_ttl(env, &key);
+    }
+    list
 }
 
 fn is_initialized(env: &Env) -> bool {
@@ -249,6 +403,19 @@ fn extend_address_index_ttl(env: &Env, key: &DataKey) {
         env.storage()
             .persistent()
             .extend_ttl(key, PERSISTENT_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+    }
+}
+
+/// Extend the TTLs of an address's index: its bookkeeping, page 0 and the
+/// page currently being filled (#103, #104). Older full pages are extended
+/// whenever a paginated query reads them, which keeps the bump bounded.
+fn extend_address_index_ttls(env: &Env, kind: IndexKind, addr: &Address) {
+    extend_address_index_ttl(env, &index_meta_key(kind, addr));
+    extend_address_index_ttl(env, &index_page_key(kind, addr, 0));
+    let meta = read_index_meta(env, kind, addr);
+    if meta.len > meta.head {
+        let (last_page, _) = index_slot(&meta, meta.len - 1);
+        extend_address_index_ttl(env, &index_page_key(kind, addr, last_page));
     }
 }
 
@@ -589,8 +756,8 @@ impl CertChainCredential {
         extend_instance_ttl(&env);
 
         // ── New in CertChain v2: maintain per-student and per-issuer indices ──
-        append_to_address_index(&env, &DataKey::StudentIndex(student.clone()), token_id);
-        append_to_address_index(&env, &DataKey::IssuerIndex(issuer.clone()), token_id);
+        append_to_address_index(&env, IndexKind::Student, &student, token_id);
+        append_to_address_index(&env, IndexKind::Issuer, &issuer, token_id);
 
         env.events().publish(
             (symbol_short!("cred_iss"), token_id),
@@ -700,12 +867,8 @@ impl CertChainCredential {
             extend_credential_ttl(&env, token_id, &input.credential_hash);
 
             // ── CertChain v2: per-student / per-issuer index ──
-            append_to_address_index(
-                &env,
-                &DataKey::StudentIndex(input.student.clone()),
-                token_id,
-            );
-            append_to_address_index(&env, &DataKey::IssuerIndex(issuer.clone()), token_id);
+            append_to_address_index(&env, IndexKind::Student, &input.student, token_id);
+            append_to_address_index(&env, IndexKind::Issuer, &issuer, token_id);
 
             seen_hashes.push_back(input.credential_hash.clone());
             next_token_id += 1;
@@ -902,8 +1065,8 @@ impl CertChainCredential {
         // Keep the per-address histories alive with the credential, so a keeper
         // that only bumps credentials does not let get_credentials_by_student /
         // get_credentials_by_issuer go incomplete (#103).
-        extend_address_index_ttl(&env, &DataKey::StudentIndex(credential.student.clone()));
-        extend_address_index_ttl(&env, &DataKey::IssuerIndex(credential.issuer.clone()));
+        extend_address_index_ttls(&env, IndexKind::Student, &credential.student);
+        extend_address_index_ttls(&env, IndexKind::Issuer, &credential.issuer);
         extend_total_credentials_ttl(&env);
         extend_instance_ttl(&env);
         Ok(())
@@ -1028,14 +1191,22 @@ impl CertChainCredential {
             .get::<DataKey, u32>(&DataKey::StorageVersion)
             .unwrap_or(1);
 
-        if current_version < 2 {
+        // Forward-only (#109): a binary never downgrades or reinterprets
+        // state written by a newer schema.
+        if current_version > CURRENT_STORAGE_VERSION {
+            return Err(ContractError::UnsupportedStorageVersion);
+        }
+
+        if current_version < CURRENT_STORAGE_VERSION {
             // Perform schema / data migration logic here.
             // E.g., initializing/updating storage parameters, etc.
             env.storage()
                 .instance()
-                .set(&DataKey::StorageVersion, &2u32);
-            env.events()
-                .publish((symbol_short!("migrated"), current_version), 2u32);
+                .set(&DataKey::StorageVersion, &CURRENT_STORAGE_VERSION);
+            env.events().publish(
+                (symbol_short!("migrated"), current_version),
+                CURRENT_STORAGE_VERSION,
+            );
         }
 
         Ok(())
@@ -1045,51 +1216,64 @@ impl CertChainCredential {
     // CertChain v2 — new query functions
     // -----------------------------------------------------------------------
 
-    /// Return all token IDs ever issued to `student`.
+    /// Return the first page of token IDs issued to `student` (up to
+    /// `INDEX_PAGE_SIZE`, or the whole pre-pagination history).
     ///
-    /// The list is populated by `issue_credential` and `batch_issue_credential`
-    /// at issuance time (CertChain v2). Returns an empty Vec for addresses that
-    /// have no credentials on this contract, or for pre-v2 issuances that
-    /// pre-date the index. Revocation does not remove entries from this list —
-    /// use `get_credential(token_id).revoked` to filter.
+    /// The index is populated by `issue_credential` and
+    /// `batch_issue_credential` at issuance time (CertChain v2). Returns an
+    /// empty Vec for addresses with no credentials, or for pre-v2 issuances
+    /// that pre-date the index. Revocation does not remove entries — use
+    /// `get_credential(token_id).revoked` to filter. Use
+    /// `get_credentials_by_student_page` to walk a longer history (#104).
     pub fn get_credentials_by_student(env: Env, student: Address) -> Vec<u64> {
         extend_instance_ttl(&env);
-        let key = DataKey::StudentIndex(student);
-        let list: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-        if !list.is_empty() {
-            env.storage().persistent().extend_ttl(
-                &key,
-                PERSISTENT_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-        }
-        list
+        first_index_page(&env, IndexKind::Student, &student)
     }
 
-    /// Return all token IDs ever issued *by* `issuer`.
-    ///
-    /// Same semantics as `get_credentials_by_student`: built from the v2 index,
-    /// empty for pre-v2 history, revoked credentials remain in the list.
+    /// Return the first page of token IDs issued *by* `issuer`. Same semantics
+    /// as `get_credentials_by_student`; use `get_credentials_by_issuer_page`
+    /// for the rest of the history (#104).
     pub fn get_credentials_by_issuer(env: Env, issuer: Address) -> Vec<u64> {
         extend_instance_ttl(&env);
-        let key = DataKey::IssuerIndex(issuer);
-        let list: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(&env));
-        if !list.is_empty() {
-            env.storage().persistent().extend_ttl(
-                &key,
-                PERSISTENT_THRESHOLD,
-                PERSISTENT_BUMP_AMOUNT,
-            );
-        }
-        list
+        first_index_page(&env, IndexKind::Issuer, &issuer)
+    }
+
+    /// Up to `limit` (max `INDEX_PAGE_SIZE`) token IDs issued to `student`,
+    /// starting at position `cursor` (0 for the first page). Positions are
+    /// stable: entries are only ever appended. Pass the returned
+    /// `next_cursor` to continue; it is `None` once the history is exhausted.
+    pub fn get_credentials_by_student_page(
+        env: Env,
+        student: Address,
+        cursor: u64,
+        limit: u32,
+    ) -> IndexPage {
+        extend_instance_ttl(&env);
+        read_index_range(&env, IndexKind::Student, &student, cursor, limit)
+    }
+
+    /// Paginated counterpart of `get_credentials_by_issuer`; see
+    /// `get_credentials_by_student_page`.
+    pub fn get_credentials_by_issuer_page(
+        env: Env,
+        issuer: Address,
+        cursor: u64,
+        limit: u32,
+    ) -> IndexPage {
+        extend_instance_ttl(&env);
+        read_index_range(&env, IndexKind::Issuer, &issuer, cursor, limit)
+    }
+
+    /// Number of token IDs in `student`'s index.
+    pub fn count_credentials_by_student(env: Env, student: Address) -> u64 {
+        extend_instance_ttl(&env);
+        read_index_meta(&env, IndexKind::Student, &student).len
+    }
+
+    /// Number of token IDs in `issuer`'s index.
+    pub fn count_credentials_by_issuer(env: Env, issuer: Address) -> u64 {
+        extend_instance_ttl(&env);
+        read_index_meta(&env, IndexKind::Issuer, &issuer).len
     }
 
     /// Return static metadata about this contract (name + semver string).
@@ -3392,6 +3576,463 @@ mod tests {
                 Ok(())
             );
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // #104: paginated student/issuer indexes
+    // -----------------------------------------------------------------------
+
+    fn hash_from_u32(env: &Env, n: u32) -> BytesN<32> {
+        let mut bytes = [0xA5u8; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        BytesN::from_array(env, &bytes)
+    }
+
+    fn issue_n(env: &Env, contract: &Address, issuer: &Address, student: &Address, n: u32) {
+        for i in 0..n {
+            env.as_contract(contract, || {
+                CertChainCredential::issue_credential(
+                    env.clone(),
+                    student.clone(),
+                    issuer.clone(),
+                    hash_from_u32(env, i),
+                    String::from_str(env, "ipfs://history"),
+                )
+                .unwrap();
+            });
+        }
+    }
+
+    /// Walk the whole index with `page_fn`, asserting every page respects
+    /// `limit` and returning all ids in order.
+    fn walk_pages(
+        env: &Env,
+        contract: &Address,
+        limit: u32,
+        page_fn: fn(Env, Address, u64, u32) -> IndexPage,
+        addr: &Address,
+    ) -> Vec<u64> {
+        let mut all = Vec::new(env);
+        let mut cursor = 0u64;
+        loop {
+            let page = env.as_contract(contract, || {
+                page_fn(env.clone(), addr.clone(), cursor, limit)
+            });
+            assert!(page.ids.len() <= limit.min(INDEX_PAGE_SIZE));
+            all.append(&page.ids);
+            match page.next_cursor {
+                Some(next) => {
+                    assert!(next > cursor, "cursor must advance");
+                    cursor = next;
+                }
+                None => break,
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn test_index_pages_return_every_id_in_order_with_stable_cursors() {
+        let (env, contract, _, issuer, student) = setup();
+        let total = INDEX_PAGE_SIZE * 2 + 37;
+        issue_n(&env, &contract, &issuer, &student, total);
+        let mut expected = Vec::new(&env);
+        for id in 1..=total as u64 {
+            expected.push_back(id);
+        }
+
+        for limit in [1, 7, INDEX_PAGE_SIZE, INDEX_PAGE_SIZE * 5] {
+            assert_eq!(
+                walk_pages(
+                    &env,
+                    &contract,
+                    limit,
+                    CertChainCredential::get_credentials_by_student_page,
+                    &student
+                ),
+                expected,
+                "student, limit {limit}"
+            );
+            assert_eq!(
+                walk_pages(
+                    &env,
+                    &contract,
+                    limit,
+                    CertChainCredential::get_credentials_by_issuer_page,
+                    &issuer
+                ),
+                expected,
+                "issuer, limit {limit}"
+            );
+        }
+
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::count_credentials_by_student(env.clone(), student.clone()),
+                total as u64
+            );
+            // A cursor obtained earlier still points at the same entries after
+            // more credentials are issued (append-only positions).
+            let before = CertChainCredential::get_credentials_by_student_page(
+                env.clone(),
+                student.clone(),
+                150,
+                10,
+            );
+            assert_eq!(before.ids.get(0), Some(151));
+            assert_eq!(before.next_cursor, Some(160));
+        });
+        issue_n_from(&env, &contract, &issuer, &student, 900_000, 5);
+        env.as_contract(&contract, || {
+            let after = CertChainCredential::get_credentials_by_student_page(
+                env.clone(),
+                student.clone(),
+                150,
+                10,
+            );
+            assert_eq!(
+                after.ids.get(0),
+                Some(151),
+                "cursor moved after more issuance"
+            );
+            let past_end = CertChainCredential::get_credentials_by_student_page(
+                env.clone(),
+                student.clone(),
+                total as u64 + 5,
+                10,
+            );
+            assert!(past_end.ids.is_empty());
+            assert_eq!(past_end.next_cursor, None);
+            // The legacy whole-list query keeps returning the first page.
+            let first =
+                CertChainCredential::get_credentials_by_student(env.clone(), student.clone());
+            assert_eq!(first.len(), INDEX_PAGE_SIZE);
+            assert_eq!(first.get(0), Some(1));
+        });
+    }
+
+    #[test]
+    fn test_large_history_issuance_cost_is_bounded() {
+        let (env, contract, _, issuer, student) = setup();
+        let fresh_issuer = Address::generate(&env);
+        env.as_contract(&contract, || {
+            CertChainCredential::authorize_issuer(env.clone(), fresh_issuer.clone());
+        });
+
+        let measure_issue = |issuer: &Address, student: &Address, seed: u32| -> u64 {
+            // Each issuance runs under the default (network) budget, so a
+            // long history must never exhaust resources.
+            env.cost_estimate().budget().reset_default();
+            env.as_contract(&contract, || {
+                CertChainCredential::issue_credential(
+                    env.clone(),
+                    student.clone(),
+                    issuer.clone(),
+                    hash_from_u32(&env, seed),
+                    String::from_str(&env, "ipfs://history"),
+                )
+                .unwrap();
+            });
+            env.cost_estimate().budget().cpu_instruction_cost()
+        };
+
+        // Six pages of history for one student and one issuer.
+        issue_n(&env, &contract, &issuer, &student, INDEX_PAGE_SIZE * 6);
+
+        // At the same point in time, issuing into that long history must cost
+        // about the same as issuing for addresses with no history at all.
+        let with_history = measure_issue(&issuer, &student, 1_000_000);
+        let without_history = measure_issue(&fresh_issuer, &Address::generate(&env), 1_000_001);
+        assert!(
+            with_history <= without_history + without_history / 5,
+            "issuance cost depends on history length: {without_history} (none) vs {with_history} (600 entries)"
+        );
+
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::count_credentials_by_student(env.clone(), student.clone()),
+                (INDEX_PAGE_SIZE * 6 + 1) as u64
+            );
+        });
+    }
+
+    fn issue_n_from(
+        env: &Env,
+        contract: &Address,
+        issuer: &Address,
+        student: &Address,
+        first_seed: u32,
+        n: u32,
+    ) {
+        for i in 0..n {
+            env.as_contract(contract, || {
+                CertChainCredential::issue_credential(
+                    env.clone(),
+                    student.clone(),
+                    issuer.clone(),
+                    hash_from_u32(env, first_seed + i),
+                    String::from_str(env, "ipfs://history"),
+                )
+                .unwrap();
+            });
+        }
+    }
+
+    #[test]
+    fn test_pre_pagination_index_is_kept_as_frozen_first_page() {
+        let (env, contract, _, issuer, student) = setup();
+        // Simulate a history written before pagination: one oversized vector
+        // under the original key and no bookkeeping entry.
+        let legacy_len = INDEX_PAGE_SIZE + 20;
+        env.as_contract(&contract, || {
+            let mut legacy = Vec::new(&env);
+            for id in 1..=legacy_len as u64 {
+                legacy.push_back(id * 1000);
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::StudentIndex(student.clone()), &legacy);
+        });
+        issue_n(&env, &contract, &issuer, &student, 3);
+
+        let all = walk_pages(
+            &env,
+            &contract,
+            33,
+            CertChainCredential::get_credentials_by_student_page,
+            &student,
+        );
+        assert_eq!(all.len(), legacy_len + 3);
+        assert_eq!(all.get(0), Some(1000));
+        assert_eq!(all.get(legacy_len - 1), Some(legacy_len as u64 * 1000));
+        // New issuances land after the legacy history, untouched.
+        assert_eq!(all.slice(legacy_len..), vec![&env, 1, 2, 3]);
+        env.as_contract(&contract, || {
+            let first =
+                CertChainCredential::get_credentials_by_student(env.clone(), student.clone());
+            assert_eq!(first.len(), legacy_len);
+        });
+    }
+
+    #[test]
+    fn test_index_page_limit_is_clamped() {
+        let (env, contract, _, issuer, student) = setup();
+        issue_n(&env, &contract, &issuer, &student, 5);
+        env.as_contract(&contract, || {
+            let zero = CertChainCredential::get_credentials_by_student_page(
+                env.clone(),
+                student.clone(),
+                0,
+                0,
+            );
+            assert_eq!(zero.ids.len(), 1, "limit 0 is treated as 1");
+            assert_eq!(zero.next_cursor, Some(1));
+            let empty = CertChainCredential::get_credentials_by_issuer_page(
+                env.clone(),
+                Address::generate(&env),
+                0,
+                10,
+            );
+            assert!(empty.ids.is_empty());
+            assert_eq!(empty.next_cursor, None);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // #107: issuer profile values exactly at the cap are stored verbatim
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_set_issuer_profile_accepts_name_and_uri_at_cap() {
+        let (env, contract, _, issuer, _) = setup();
+        env.as_contract(&contract, || {
+            let name = dummy_long_str(&env, MAX_ISSUER_NAME_LEN as usize);
+            let uri = dummy_long_str(&env, MAX_ISSUER_PROFILE_URI_LEN as usize);
+            assert_eq!(name.len(), MAX_ISSUER_NAME_LEN);
+            assert_eq!(uri.len(), MAX_ISSUER_PROFILE_URI_LEN);
+
+            CertChainCredential::set_issuer_profile(
+                env.clone(),
+                issuer.clone(),
+                name.clone(),
+                uri.clone(),
+            )
+            .unwrap();
+
+            let profile =
+                CertChainCredential::get_issuer_profile(env.clone(), issuer.clone()).unwrap();
+            assert_eq!(profile.name, name);
+            assert_eq!(profile.profile_uri, uri);
+            assert_eq!(profile.name.len(), MAX_ISSUER_NAME_LEN);
+            assert_eq!(profile.profile_uri.len(), MAX_ISSUER_PROFILE_URI_LEN);
+        });
+    }
+
+    #[test]
+    fn test_set_issuer_profile_one_byte_over_either_cap_is_rejected() {
+        let (env, contract, _, issuer, _) = setup();
+        let at_name = dummy_long_str(&env, MAX_ISSUER_NAME_LEN as usize);
+        let at_uri = dummy_long_str(&env, MAX_ISSUER_PROFILE_URI_LEN as usize);
+        let over_name = dummy_long_str(&env, (MAX_ISSUER_NAME_LEN + 1) as usize);
+        let over_uri = dummy_long_str(&env, (MAX_ISSUER_PROFILE_URI_LEN + 1) as usize);
+
+        // Separate frames: mock_all_auths rejects a second require_auth for
+        // the same address within one frame.
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::set_issuer_profile(
+                    env.clone(),
+                    issuer.clone(),
+                    over_name,
+                    at_uri
+                ),
+                Err(ContractError::ProfileTooLarge)
+            );
+        });
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::set_issuer_profile(
+                    env.clone(),
+                    issuer.clone(),
+                    at_name,
+                    over_uri
+                ),
+                Err(ContractError::ProfileTooLarge)
+            );
+        });
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::get_issuer_profile(env.clone(), issuer),
+                None
+            );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // #108: a second propose_upgrade replaces the first and restarts the lock
+    // -----------------------------------------------------------------------
+
+    fn last_upgrade_proposal_event(env: &Env) -> (BytesN<32>, u32) {
+        let events = env.events().all();
+        let event = events.events().last().unwrap();
+        match &event.body {
+            soroban_sdk::xdr::ContractEventBody::V0(body) => {
+                let topics: soroban_sdk::Vec<Val> = body.topics.clone().try_into_val(env).unwrap();
+                assert_eq!(topics, vec![env, symbol_short!("upg_prop").into_val(env)]);
+                let data: Val = body.data.clone().try_into_val(env).unwrap();
+                data.try_into_val(env).unwrap()
+            }
+        }
+    }
+
+    #[test]
+    fn test_re_proposal_replaces_pending_upgrade_and_restarts_timelock() {
+        use soroban_sdk::testutils::Ledger;
+        let (env, contract, _, _, _) = setup();
+        let hash_a = dummy_hash(&env, 0xA1);
+        let hash_b = dummy_hash(&env, 0xB2);
+
+        let start = env.ledger().sequence();
+        env.as_contract(&contract, || {
+            CertChainCredential::propose_upgrade(env.clone(), hash_a.clone()).unwrap();
+        });
+        assert_eq!(
+            last_upgrade_proposal_event(&env),
+            (hash_a.clone(), start + UPGRADE_TIMELOCK_LEDGERS)
+        );
+
+        // Half-way through A's timelock, B is proposed.
+        let mid = start + UPGRADE_TIMELOCK_LEDGERS / 2;
+        env.ledger().set_sequence_number(mid);
+        env.as_contract(&contract, || {
+            CertChainCredential::propose_upgrade(env.clone(), hash_b.clone()).unwrap();
+        });
+        let b_ready = mid + UPGRADE_TIMELOCK_LEDGERS;
+        assert_eq!(last_upgrade_proposal_event(&env), (hash_b.clone(), b_ready));
+
+        env.as_contract(&contract, || {
+            let pending = CertChainCredential::get_pending_upgrade(env.clone()).unwrap();
+            assert_eq!(pending.wasm_hash, hash_b);
+            assert_eq!(
+                pending.ready_ledger, b_ready,
+                "re-proposal restarts the timelock"
+            );
+        });
+
+        // Once A's original timelock has passed, neither A nor B can execute:
+        // A was replaced, and B's own timelock is still running.
+        env.ledger()
+            .set_sequence_number(start + UPGRADE_TIMELOCK_LEDGERS);
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::upgrade(env.clone(), hash_a.clone()),
+                Err(ContractError::UpgradeHashMismatch)
+            );
+        });
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::upgrade(env.clone(), hash_b.clone()),
+                Err(ContractError::UpgradeTimelockActive)
+            );
+        });
+
+        // After B's full timelock, A is still refused; only B is eligible.
+        env.ledger().set_sequence_number(b_ready);
+        env.as_contract(&contract, || {
+            assert_eq!(
+                CertChainCredential::upgrade(env.clone(), hash_a.clone()),
+                Err(ContractError::UpgradeHashMismatch)
+            );
+        });
+        env.as_contract(&contract, || {
+            let pending = CertChainCredential::get_pending_upgrade(env.clone()).unwrap();
+            assert_eq!(pending.wasm_hash, hash_b);
+            assert!(env.ledger().sequence() >= pending.ready_ledger);
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // #109: storage migrations are forward-only
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_migrate_rejects_newer_storage_version() {
+        let (env, contract, _, _, _) = setup();
+        let client = CertChainCredentialClient::new(&env, &contract);
+        env.as_contract(&contract, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::StorageVersion, &(CURRENT_STORAGE_VERSION + 1));
+        });
+
+        assert_eq!(
+            client.try_migrate(),
+            Err(Ok(ContractError::UnsupportedStorageVersion))
+        );
+        // State written by the newer schema is left untouched.
+        assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION + 1);
+    }
+
+    #[test]
+    fn test_migrate_moves_forward_from_every_older_version() {
+        for start in [0u32, 1] {
+            let (env, contract, _, _, _) = setup();
+            let client = CertChainCredentialClient::new(&env, &contract);
+            env.as_contract(&contract, || {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::StorageVersion, &start);
+            });
+            client.migrate();
+            assert_eq!(
+                client.get_storage_version(),
+                CURRENT_STORAGE_VERSION,
+                "from {start}"
+            );
+            // Already current: migrating again is a no-op, not an error.
+            client.migrate();
+            assert_eq!(client.get_storage_version(), CURRENT_STORAGE_VERSION);
+        }
     }
 } // end mod tests
 
