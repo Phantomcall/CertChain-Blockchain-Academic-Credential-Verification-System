@@ -23,7 +23,7 @@ MAINNET_DEPLOYER ?= mainnet-deployer
 OWNER_IDENTITY   ?= owner
 
 .PHONY: all build test test-verbose test-property \
-        deploy-testnet deploy-mainnet initialize-testnet \
+        deploy-testnet deploy-mainnet initialize-testnet post-deploy smoke-test \
         fetch-info check-issuer check-owner check-paused check-total \
         authorize-issuer revoke-issuer bump-credential \
         pause unpause \
@@ -114,7 +114,37 @@ initialize-testnet:
 		--source $(TESTNET_DEPLOYER) \
 		-- initialize \
 		--owner $$(stellar keys address $(TESTNET_DEPLOYER))
-	@echo "✅ Contract initialized. Owner: $$(stellar keys address $(TESTNET_DEPLOYER))"
+	@echo "✅ Contract initialized. Owner: $(stellar keys address $(TESTNET_DEPLOYER))"
+
+# Smoke-test deployed contracts: verifies get_contract_info, get_owner, and is_paused.
+# Fails fast on uninitialized contract, wrong address, or unexpected version/owner.
+# Usage: make post-deploy CONTRACT_ID=C... [EXPECTED_OWNER=G...] [EXPECTED_VERSION=...]
+post-deploy:
+	@test -n "$(CONTRACT_ID)" || (echo "❌ Usage: make post-deploy CONTRACT_ID=<id> [EXPECTED_OWNER=<address>]" && exit 1)
+	@echo "🔍 Running post-deploy smoke tests for contract $(CONTRACT_ID)..."
+	@echo "  [1/3] Verifying contract info..."
+	@INFO=$(stellar contract invoke --id $(CONTRACT_ID) --network $(TESTNET_NETWORK) --source $(TESTNET_DEPLOYER) -- get_contract_info) || (echo "❌ Post-deploy failed: get_contract_info call failed" && exit 1); \
+	if [ -n "$(EXPECTED_VERSION)" ]; then \
+		echo "$INFO" | grep -q "$(EXPECTED_VERSION)" || (echo "❌ Version mismatch: expected '$(EXPECTED_VERSION)', got: $INFO" && exit 1); \
+	fi; \
+	echo "  ✅ Contract info verified: $INFO"
+	@echo "  [2/3] Verifying contract owner..."
+	@OWNER=$(stellar contract invoke --id $(CONTRACT_ID) --network $(TESTNET_NETWORK) --source $(TESTNET_DEPLOYER) -- get_owner) || (echo "❌ Post-deploy failed: contract uninitialized or invalid address" && exit 1); \
+	TARGET_OWNER="$(EXPECTED_OWNER)"; \
+	if [ -z "$TARGET_OWNER" ]; then \
+		TARGET_OWNER=$(stellar keys address $(TESTNET_DEPLOYER) 2>/dev/null || true); \
+	fi; \
+	if [ -n "$TARGET_OWNER" ]; then \
+		echo "$OWNER" | grep -q "$TARGET_OWNER" || (echo "❌ Owner mismatch: expected '$TARGET_OWNER', got: $OWNER" && exit 1); \
+	fi; \
+	echo "  ✅ Owner verified: $OWNER"
+	@echo "  [3/3] Verifying contract pause status..."
+	@PAUSED=$(stellar contract invoke --id $(CONTRACT_ID) --network $(TESTNET_NETWORK) --source $(TESTNET_DEPLOYER) -- is_paused) || (echo "❌ Post-deploy failed: is_paused check failed" && exit 1); \
+	echo "  ✅ Contract pause status verified: $PAUSED"
+	@echo "🎉 Post-deploy smoke test passed successfully for $(CONTRACT_ID)!"
+
+smoke-test: post-deploy
+
 
 deploy-mainnet: build
 	@echo ""
