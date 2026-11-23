@@ -269,8 +269,11 @@ This single contract replaces two separate EVM contracts (CredentialNFT + Creden
 | `is_revoked(token_id)` | Public | Check revocation status |
 | `total_credentials()` | Public | Get total credentials ever issued |
 | `bump_credential(token_id)` | Public | Permissionlessly extend a credential's TTL |
-| `get_credentials_by_student(student)` | Public | **New v2** — all token IDs issued to an address |
-| `get_credentials_by_issuer(issuer)` | Public | **New v2** — all token IDs issued by an address |
+| `get_credentials_by_student(student)` | Public | **New v2** — first page of token IDs issued to an address |
+| `get_credentials_by_issuer(issuer)` | Public | **New v2** — first page of token IDs issued by an address |
+| `get_credentials_by_student_page(student, cursor, limit)` | Public | Paginated history: up to 100 IDs from `cursor`, plus `next_cursor` |
+| `get_credentials_by_issuer_page(issuer, cursor, limit)` | Public | Paginated history: up to 100 IDs from `cursor`, plus `next_cursor` |
+| `count_credentials_by_student(student)` / `count_credentials_by_issuer(issuer)` | Public | Number of token IDs in an address's history |
 | `get_contract_info()` | Public | **New v2** — contract name and semver string |
 | `set_issuer_profile(issuer, name, uri)` | Authorized issuer | Publish issuer's on-chain identity |
 | `get_issuer_profile(issuer)` | Public | Resolve issuer address to identity |

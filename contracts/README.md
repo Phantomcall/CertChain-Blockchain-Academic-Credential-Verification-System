@@ -418,6 +418,15 @@ To upgrade the contract WASM:
      migrate
    ```
 
+   **Migrations are forward-only.** `migrate` moves storage from any older
+   schema version up to the version this binary implements
+   (`CURRENT_STORAGE_VERSION`, currently `2`) and is a no-op when already
+   current. If the stored version is *newer* than the binary (for example an
+   older WASM re-deployed over state written by a newer one), `migrate` fails
+   with `UnsupportedStorageVersion` (error code `18`) and leaves the state
+   untouched. To roll back, deploy a binary that understands the stored
+   version rather than downgrading the data.
+
 ## Storage Archival & TTL Strategy
 
 Soroban persistent storage entries have a finite TTL (Time-To-Live) measured in ledgers. Entries whose TTL expires are **archived** and become inaccessible until restored. For a credential platform this is a correctness failure — `verify_credential` would silently return `None` for a legitimately issued credential.
