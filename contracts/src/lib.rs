@@ -1958,7 +1958,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn test_revoke_never_authorized_issuer_emits_no_event() {
         let env = Env::default();
         env.mock_all_auths();
